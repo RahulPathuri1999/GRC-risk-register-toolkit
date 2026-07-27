@@ -233,12 +233,19 @@ def main():
     for i, risk in enumerate(risks):
         report = run_checks(risk, existing_rows)
         reports.append(report)
+        fallback_id = f"R-{row - 1:03d}"
         if args.apply:
-            write_row(ws, row, risk, f"R-{row - 1:03d}")
-            # newly-written risk becomes visible to duplicate/overlap checks for the *next*
-            # risk in this same batch, so a batch of related risks checks against each other too
-            existing_rows.append({**{k: risk.get(k) for k in COLS}, "risk_id": risk.get("risk_id", f"R-{row-1:03d}"),
-                                   "residual_risk_level": None, "_row": row})
+            write_row(ws, row, risk, fallback_id)
+        # Always add this risk to existing_rows (even in dry-run) so later risks in the SAME
+        # batch are checked against it too -- otherwise a dry-run preview wrongly misses
+        # duplicates/overlaps between risks submitted together in one file.
+        existing_rows.append({
+            **{k: risk.get(k) for k in COLS},
+            "risk_id": risk.get("risk_id", fallback_id),
+            "residual_risk_level": None,
+            "_row": row,
+        })
+        if args.apply:
             row += 1
 
     print(json.dumps(reports, indent=2))

@@ -33,7 +33,29 @@ To bulk-add risks via script:
 pip install openpyxl
 python scripts/populate_risk_register.py assets/risk_register_template.xlsx your_risks.json
 ```
+By default this is a **dry run** — it prints a JSON report of pre-flight checks (see below) and
+writes nothing. Review the findings, then re-run with `--apply` to actually write the rows:
+```bash
+python scripts/populate_risk_register.py assets/risk_register_template.xlsx your_risks.json --apply
+```
 See the docstring at the top of `populate_risk_register.py` for the expected JSON format.
+
+## Pre-flight checks
+
+Before writing anything, the script scans the existing register and flags three things a
+person would otherwise have to catch by re-reading the whole sheet:
+
+- **Duplicate check** — an existing risk on the same asset with similar wording (paraphrases
+  count too, not just near-identical text).
+- **Control propagation check** — an existing risk on the same asset whose Treatment Plan
+  keywords (MFA, encryption, training, backup, SLA, etc.) suggest the new risk's fix would also
+  help it, meaning its Residual Score may be stale.
+- **Blast radius check** — if the new risk introduces a brand-new asset, flags existing assets
+  it's plausibly connected to, so their CIA ratings/descriptions can be reviewed too.
+
+These are candidate flags, not verdicts — the script never merges rows or edits other rows'
+scores on its own. A flagged pair can turn out to be unrelated on a closer read; that's fine,
+the checks are tuned to over-flag rather than risk missing something.
 
 ## What makes this "automated"
 
@@ -44,3 +66,6 @@ See the docstring at the top of `populate_risk_register.py` for the expected JSO
   after — so a control's actual effect is provable (e.g. Critical → Medium), not just claimed.
 - **The script does the repetitive part** (adding rows, applying formulas consistently) so
   bulk-adding risks doesn't mean retyping formulas by hand.
+- **Adding a risk triggers a review of the whole register, not just a new row.** Past a
+  handful of entries, catching duplicates and control overlap by eye doesn't scale — the
+  pre-flight checks do that re-scan automatically every time something is added.

@@ -1,78 +1,99 @@
 """
-Append new risks to a risk register built from risk_register_template.xlsx or
-risk_register_starter_kit.xlsx (both share the same column schema), with pre-flight
-checks that catch what a person re-scanning the whole sheet by eye would look for:
+Append new risks to a risk register built from the organizational template
+(33-column schema: Asset Evaluation | Risk Identification | Risk Analysis |
+Risk Mitigation | Residual Risk Assessment | Residual Risk Description).
 
-  1. duplicate_check          - existing risks on the same asset with similar wording
-  2. control_propagation_check- existing risks whose residual score might also improve
-  3. blast_radius_check       - flags when a new asset connects to ones already tracked
+Key differences from the simpler schema this project started with:
+  - Risk = Asset Value (C+I+A) x Likelihood x Consequence (3-factor, not 2-factor)
+  - "Threats" and "Vulnerabilities" are separate columns, not one description field
+  - Asset ID/Name/Owner/Date are only filled on the FIRST row for a given asset;
+    subsequent risk rows for that asset leave those columns blank (but C/I/A/Asset
+    Value ARE repeated on every row for that asset, per the template's own example data)
+  - Risk Value/Risk Level and Post-Mit Risk Value/Risk Level had NO formulas in the
+    template as uploaded -- this script adds them as real Excel formulas so the sheet
+    recalculates itself, instead of requiring the numbers to be typed in by hand
 
 Usage:
-    python populate_risk_register.py <path_to_register.xlsx> <path_to_risks.json> [--apply]
+    python populate_risk_register.py <register.xlsx> <risks.json> [--apply]
 
-Without --apply (default): prints a JSON report of findings for each risk and does NOT
-write anything. Review the report, then re-run with --apply to actually append the rows.
+Without --apply (default): prints a JSON report of pre-flight checks and writes nothing.
+With --apply: writes the rows after printing the same report.
 
 risks.json format (a list of objects):
 [
   {
-    "asset_id": "AST-016",
-    "asset_name": "Development Environment",
-    "asset_type": "Server",
-    "confidentiality": "Medium",
-    "integrity": "Medium",
-    "availability": "Low",
-    "risk_id": "R-016",
-    "description": "Production credentials hardcoded in a shared dev repository",
-    "category": "Cybersecurity",
-    "likelihood": 3,
-    "impact": 4,
-    "existing_controls": "Code review process (not consistently enforced)",
-    "treatment_plan": "Move secrets to a vault (e.g. HashiCorp Vault); add pre-commit secret scanning",
-    "residual_likelihood": 1,
-    "residual_impact": 4,
-    "owner": "Engineering",
-    "status": "Open",
-    "review_date": "2026-10-01"
+    "asset_id": "A-002",                 # required. Reuse an existing ID to add another
+                                          # risk to that asset; use a new ID to add an asset.
+    "asset_name": "Finance Shared Drive", # required only when asset_id is new
+    "asset_owner": "Priya",               # required only when asset_id is new
+    "identification_date": "2026-07-27",  # optional, defaults to today; only used when new
+    "confidentiality": 3, "integrity": 2, "availability": 1,   # 1-3 each; required when new
+    "risk_id": "R-006",                   # optional, auto-numbered if omitted
+    "threat": "Unauthorized access to shared financial files",
+    "vulnerability": "No folder-level permission restrictions",
+    "likelihood": 3, "consequence": 4,    # 1-5 each
+    "risk_treatment_option": "Mitigate",  # Accept / Avoid / Transfer / Mitigate
+    "existing_controls": "None",
+    "mitigation_plan": "Restrict folder access to Finance team via AD group",
+    "iso_control": "A.9.1.2",
+    "mitigation_responsibility": "IT Ops",
+    "mitigation_target_date": "2026-09-01",
+    "mitigation_status": "Pending Approval",
+    "risk_status": "Open",
+    "residual_likelihood": 1, "residual_impact": 3,
+    "residual_description": "Access limited to Finance team only",
+    "residual_control": "AD group + quarterly access review",
+    "risk_control_responsibility": "IT Ops",
+    "control_target_date": "2026-09-15",
+    "control_status": "Pending Approval",
+    "residual_risk_status": "Monitored"
   }
 ]
-
-All fields are optional except a meaningful "description". Confidentiality/Integrity/
-Availability accept "High"/"Medium"/"Low". Residual fields are optional -- leave them out if a
-treatment plan isn't decided yet. Risk Score, Risk Level, Residual Risk Score, and Residual
-Risk Level are all written as formulas (not computed in Python), so the sheet keeps
-recalculating itself if any Likelihood/Impact value is edited later.
+Only asset_id + threat are truly required; everything else is optional and left blank if
+omitted. Risk Value / Risk Level / Post-Mit Risk Value / Risk Level are always written as
+formulas, never computed in Python.
 """
 import sys
 import json
 import re
 import argparse
+import datetime
 from difflib import SequenceMatcher
 import openpyxl
 
-# column letters, 1-indexed to match the sheet
+DATA_START_ROW = 8  # rows 3-7 in this template are the reference/legend rows, not data
+
 COLS = {
-    "asset_id": 1, "asset_name": 2, "asset_type": 3, "confidentiality": 4, "integrity": 5,
-    "availability": 6, "risk_id": 7, "description": 8, "category": 9, "likelihood": 10,
-    "impact": 11, "risk_score": 12, "risk_level": 13, "existing_controls": 14,
-    "treatment_plan": 15, "residual_likelihood": 16, "residual_impact": 17,
-    "residual_risk_score": 18, "residual_risk_level": 19, "owner": 20, "status": 21,
-    "review_date": 22,
+    "asset_id": 1, "identification_date": 2, "asset_name": 3, "asset_owner": 4,
+    "confidentiality": 5, "integrity": 6, "availability": 7, "asset_value": 8,
+    "risk_id": 9, "threat": 10, "vulnerability": 11,
+    "likelihood": 12, "consequence": 13, "risk_value": 14, "risk_level": 15,
+    "risk_treatment_option": 16, "existing_controls": 17, "mitigation_plan": 18,
+    "iso_control": 19, "mitigation_responsibility": 20, "mitigation_target_date": 21,
+    "mitigation_status": 22, "risk_status": 23,
+    "residual_likelihood": 24, "residual_impact": 25, "post_mit_risk_value": 26,
+    "residual_risk_level": 27, "residual_description": 28, "residual_control": 29,
+    "risk_control_responsibility": 30, "control_target_date": 31, "control_status": 32,
+    "residual_risk_status": 33,
 }
+COL_LETTER = {k: openpyxl.utils.get_column_letter(v) for k, v in COLS.items()}
 
 STOPWORDS = {
     "the", "a", "an", "to", "of", "in", "on", "could", "would", "and", "or", "due",
-    "via", "for", "is", "are", "be", "by", "with", "into", "leading", "that",
+    "via", "for", "is", "are", "be", "by", "with", "into", "leading", "that", "used",
 }
 
 CONTROL_KEYWORDS = {
     "mfa": {"password", "credential", "login", "authentication", "access"},
     "multi-factor": {"password", "credential", "login", "authentication", "access"},
-    "encryption": {"data", "database", "storage", "laptop", "device"},
-    "training": {"phishing", "social", "employee", "staff", "human"},
-    "awareness": {"phishing", "social", "employee", "staff", "human"},
-    "backup": {"availability", "outage", "disaster", "downtime"},
-    "sla": {"vendor", "third-party", "breach", "notification"},
+    "encryption": {"data", "database", "storage", "laptop", "device", "media"},
+    "training": {"phishing", "social", "employee", "staff", "human", "error"},
+    "awareness": {"phishing", "social", "employee", "staff", "human", "error"},
+    "backup": {"availability", "outage", "disaster", "downtime", "power"},
+    "antivirus": {"malware", "virus", "attack"},
+    "patch": {"malware", "vulnerability", "configuration", "attack"},
+    "access": {"theft", "unauthorized", "physical", "access"},
+    "group": {"theft", "unauthorized", "access", "permission"},
 }
 
 
@@ -89,50 +110,56 @@ def text_similarity(a, b):
 
 
 def first_empty_row(ws):
-    """Find the first row with no Risk ID -- the template/starter kit are pre-formatted
-    hundreds of rows down, so ws.max_row is NOT a safe place to append."""
-    row = 2
+    row = DATA_START_ROW
     while ws.cell(row=row, column=COLS["risk_id"]).value not in (None, ""):
         row += 1
     return row
 
 
-def load_existing_rows(ws, ws_vals, up_to_row):
+def load_existing_rows(ws, up_to_row):
+    """Forward-fills Asset ID/Name/Owner/CIA/Asset Value, since the template only fills
+    those on the first row of each asset group and leaves them blank on the rest."""
     rows = []
-    for r in range(2, up_to_row):
+    last = {}
+    for r in range(DATA_START_ROW, up_to_row):
         if ws.cell(row=r, column=COLS["risk_id"]).value in (None, ""):
             continue
         row = {k: ws.cell(row=r, column=c).value for k, c in COLS.items()}
-        row["risk_level"] = ws_vals.cell(row=r, column=COLS["risk_level"]).value
-        row["residual_risk_level"] = ws_vals.cell(row=r, column=COLS["residual_risk_level"]).value
+        for field in ("asset_id", "asset_name", "asset_owner", "confidentiality",
+                      "integrity", "availability", "asset_value"):
+            if row[field] in (None, ""):
+                row[field] = last.get(field)
+            else:
+                last[field] = row[field]
         row["_row"] = r
         rows.append(row)
     return rows
 
 
-def duplicate_check(new_risk, existing_rows, threshold=0.35, same_category_threshold=0.12):
-    """Same-asset risks are flagged at a lower bar if they also share a Category --
-    a shared category plus even a single strong keyword overlap (e.g. "phishing") is a
-    much stronger duplicate signal than raw word overlap alone, and plain Jaccard similarity
-    badly under-scores paraphrases (different wording, same underlying risk)."""
+def duplicate_check(new_risk, existing_rows, threshold=0.35, same_treatment_option_threshold=0.15):
+    """Combines Threat + Vulnerability into one text for comparison, since together they
+    describe the same underlying risk that a single 'description' field would in a simpler
+    schema."""
+    new_text = f"{new_risk.get('threat', '')} {new_risk.get('vulnerability', '')}"
     flags = []
     for row in existing_rows:
         if row["asset_id"] != new_risk.get("asset_id"):
             continue
-        sim = text_similarity(new_risk.get("description"), row["description"])
-        same_category = row.get("category") == new_risk.get("category")
-        bar = same_category_threshold if same_category else threshold
+        existing_text = f"{row.get('threat', '')} {row.get('vulnerability', '')}"
+        sim = text_similarity(new_text, existing_text)
+        same_treatment = row.get("risk_treatment_option") == new_risk.get("risk_treatment_option")
+        bar = same_treatment_option_threshold if same_treatment else threshold
         if sim >= bar:
             flags.append({
-                "risk_id": row["risk_id"], "description": row["description"], "similarity": sim,
-                "same_category": same_category,
+                "risk_id": row["risk_id"], "threat": row.get("threat"),
+                "vulnerability": row.get("vulnerability"), "similarity": sim,
             })
     flags.sort(key=lambda f: -f["similarity"])
     return flags
 
 
 def control_propagation_check(new_risk, existing_rows):
-    plan_text = (new_risk.get("treatment_plan") or "").lower()
+    plan_text = (new_risk.get("mitigation_plan") or "").lower()
     matched = [kw for kw in CONTROL_KEYWORDS if kw in plan_text]
     if not matched:
         return []
@@ -141,11 +168,13 @@ def control_propagation_check(new_risk, existing_rows):
     for row in existing_rows:
         if row["asset_id"] != new_risk.get("asset_id") or row["risk_id"] == new_risk.get("risk_id"):
             continue
-        if tokenize(row["description"]) & related_terms:
+        candidate_text = f"{row.get('threat', '')} {row.get('vulnerability', '')}"
+        if tokenize(candidate_text) & related_terms:
             flags.append({
-                "risk_id": row["risk_id"], "description": row["description"],
-                "current_residual_level": row["residual_risk_level"],
-                "reason": f"Treatment plan mentions {matched}, which plausibly also mitigates this risk's cause",
+                "risk_id": row["risk_id"], "threat": row.get("threat"),
+                "current_residual_risk_level_formula_row": row["_row"],
+                "reason": f"Mitigation plan mentions {matched}, which plausibly also "
+                          f"mitigates this risk's cause",
             })
     return flags
 
@@ -165,8 +194,10 @@ def blast_radius_check(new_risk, existing_rows):
     for row in existing_rows:
         if row["asset_id"] in seen:
             continue
-        candidate_tokens = (tokenize(row.get("asset_name", "")) | tokenize(row.get("description", ""))) - GENERIC_ASSET_WORDS
-        if new_tokens & candidate_tokens:
+        candidate = (tokenize(row.get("asset_name", "")) |
+                     tokenize(row.get("threat", "")) |
+                     tokenize(row.get("vulnerability", ""))) - GENERIC_ASSET_WORDS
+        if new_tokens & candidate:
             related.append(row["asset_id"])
             seen.add(row["asset_id"])
     return {"new_asset": True, "possibly_related_existing_assets": related}
@@ -181,38 +212,64 @@ def run_checks(new_risk, existing_rows):
     }
 
 
-def write_row(ws, row, risk, fallback_id):
-    ws.cell(row=row, column=COLS["asset_id"], value=risk.get("asset_id", ""))
-    ws.cell(row=row, column=COLS["asset_name"], value=risk.get("asset_name", ""))
-    ws.cell(row=row, column=COLS["asset_type"], value=risk.get("asset_type", ""))
-    ws.cell(row=row, column=COLS["confidentiality"], value=risk.get("confidentiality", ""))
-    ws.cell(row=row, column=COLS["integrity"], value=risk.get("integrity", ""))
-    ws.cell(row=row, column=COLS["availability"], value=risk.get("availability", ""))
-    ws.cell(row=row, column=COLS["risk_id"], value=risk.get("risk_id", fallback_id))
-    ws.cell(row=row, column=COLS["description"], value=risk.get("description", ""))
-    ws.cell(row=row, column=COLS["category"], value=risk.get("category", ""))
-    ws.cell(row=row, column=COLS["likelihood"], value=risk.get("likelihood"))
-    ws.cell(row=row, column=COLS["impact"], value=risk.get("impact"))
-    ws.cell(row=row, column=COLS["risk_score"], value=f"=J{row}*K{row}")
-    ws.cell(row=row, column=COLS["risk_level"],
-            value=f'=IF(L{row}>=15,"Critical",IF(L{row}>=9,"High",IF(L{row}>=4,"Medium","Low")))')
-    ws.cell(row=row, column=COLS["existing_controls"], value=risk.get("existing_controls", ""))
-    ws.cell(row=row, column=COLS["treatment_plan"], value=risk.get("treatment_plan", ""))
-    ws.cell(row=row, column=COLS["residual_likelihood"], value=risk.get("residual_likelihood"))
-    ws.cell(row=row, column=COLS["residual_impact"], value=risk.get("residual_impact"))
-    ws.cell(row=row, column=COLS["residual_risk_score"], value=f"=P{row}*Q{row}")
-    ws.cell(row=row, column=COLS["residual_risk_level"],
-            value=f'=IF(R{row}>=15,"Critical",IF(R{row}>=9,"High",IF(R{row}>=4,"Medium","Low")))')
-    ws.cell(row=row, column=COLS["owner"], value=risk.get("owner", ""))
-    ws.cell(row=row, column=COLS["status"], value=risk.get("status", "Open"))
-    ws.cell(row=row, column=COLS["review_date"], value=risk.get("review_date", ""))
+def write_row(ws, row, risk, fallback_id, is_new_asset):
+    r = row
+    if is_new_asset:
+        ws.cell(row=r, column=COLS["asset_id"], value=risk.get("asset_id"))
+        ws.cell(row=r, column=COLS["identification_date"],
+                 value=risk.get("identification_date", datetime.date.today().isoformat()))
+        ws.cell(row=r, column=COLS["asset_name"], value=risk.get("asset_name", ""))
+        ws.cell(row=r, column=COLS["asset_owner"], value=risk.get("asset_owner", ""))
+    # C/I/A/Asset Value repeat on every row for the asset, per the template's own convention
+    ws.cell(row=r, column=COLS["confidentiality"], value=risk.get("confidentiality"))
+    ws.cell(row=r, column=COLS["integrity"], value=risk.get("integrity"))
+    ws.cell(row=r, column=COLS["availability"], value=risk.get("availability"))
+    ws.cell(row=r, column=COLS["asset_value"],
+             value=f"={COL_LETTER['confidentiality']}{r}+{COL_LETTER['integrity']}{r}+{COL_LETTER['availability']}{r}")
+
+    ws.cell(row=r, column=COLS["risk_id"], value=risk.get("risk_id", fallback_id))
+    ws.cell(row=r, column=COLS["threat"], value=risk.get("threat", ""))
+    ws.cell(row=r, column=COLS["vulnerability"], value=risk.get("vulnerability", ""))
+    ws.cell(row=r, column=COLS["likelihood"], value=risk.get("likelihood"))
+    ws.cell(row=r, column=COLS["consequence"], value=risk.get("consequence"))
+    ws.cell(row=r, column=COLS["risk_value"],
+             value=f"={COL_LETTER['asset_value']}{r}*{COL_LETTER['likelihood']}{r}*{COL_LETTER['consequence']}{r}")
+    ws.cell(row=r, column=COLS["risk_level"], value=(
+        f'=IF({COL_LETTER["risk_value"]}{r}>=225,"Extreme",'
+        f'IF({COL_LETTER["risk_value"]}{r}>=128,"Major",'
+        f'IF({COL_LETTER["risk_value"]}{r}>=37,"Medium","Minor")))'
+    ))
+    ws.cell(row=r, column=COLS["risk_treatment_option"], value=risk.get("risk_treatment_option", ""))
+    ws.cell(row=r, column=COLS["existing_controls"], value=risk.get("existing_controls", ""))
+    ws.cell(row=r, column=COLS["mitigation_plan"], value=risk.get("mitigation_plan", ""))
+    ws.cell(row=r, column=COLS["iso_control"], value=risk.get("iso_control", ""))
+    ws.cell(row=r, column=COLS["mitigation_responsibility"], value=risk.get("mitigation_responsibility", ""))
+    ws.cell(row=r, column=COLS["mitigation_target_date"], value=risk.get("mitigation_target_date", ""))
+    ws.cell(row=r, column=COLS["mitigation_status"], value=risk.get("mitigation_status", ""))
+    ws.cell(row=r, column=COLS["risk_status"], value=risk.get("risk_status", "Open"))
+
+    ws.cell(row=r, column=COLS["residual_likelihood"], value=risk.get("residual_likelihood"))
+    ws.cell(row=r, column=COLS["residual_impact"], value=risk.get("residual_impact"))
+    ws.cell(row=r, column=COLS["post_mit_risk_value"],
+             value=f"={COL_LETTER['asset_value']}{r}*{COL_LETTER['residual_likelihood']}{r}*{COL_LETTER['residual_impact']}{r}")
+    ws.cell(row=r, column=COLS["residual_risk_level"], value=(
+        f'=IF({COL_LETTER["post_mit_risk_value"]}{r}>=225,"Extreme",'
+        f'IF({COL_LETTER["post_mit_risk_value"]}{r}>=128,"Major",'
+        f'IF({COL_LETTER["post_mit_risk_value"]}{r}>=37,"Medium","Minor")))'
+    ))
+    ws.cell(row=r, column=COLS["residual_description"], value=risk.get("residual_description", ""))
+    ws.cell(row=r, column=COLS["residual_control"], value=risk.get("residual_control", ""))
+    ws.cell(row=r, column=COLS["risk_control_responsibility"], value=risk.get("risk_control_responsibility", ""))
+    ws.cell(row=r, column=COLS["control_target_date"], value=risk.get("control_target_date", ""))
+    ws.cell(row=r, column=COLS["control_status"], value=risk.get("control_status", ""))
+    ws.cell(row=r, column=COLS["residual_risk_status"], value=risk.get("residual_risk_status", ""))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("xlsx_path")
     ap.add_argument("json_path")
-    ap.add_argument("--apply", action="store_true", help="Actually write the rows (default: dry run / report only)")
+    ap.add_argument("--apply", action="store_true")
     args = ap.parse_args()
 
     with open(args.json_path) as f:
@@ -222,33 +279,28 @@ def main():
 
     wb = openpyxl.load_workbook(args.xlsx_path)
     ws = wb["Risk Register"]
-    wb_vals = openpyxl.load_workbook(args.xlsx_path, data_only=True)
-    ws_vals = wb_vals["Risk Register"]
 
     start_row = first_empty_row(ws)
-    existing_rows = load_existing_rows(ws, ws_vals, start_row)
+    existing_rows = load_existing_rows(ws, start_row)
 
     reports = []
     row = start_row
-    for i, risk in enumerate(risks):
+    for risk in risks:
         report = run_checks(risk, existing_rows)
         reports.append(report)
-        fallback_id = f"R-{row - 1:03d}"
+        fallback_id = f"R-{row - DATA_START_ROW + 1:03d}"
+        is_new_asset = not any(r["asset_id"] == risk.get("asset_id") for r in existing_rows)
         if args.apply:
-            write_row(ws, row, risk, fallback_id)
-        # Always add this risk to existing_rows (even in dry-run) so later risks in the SAME
-        # batch are checked against it too -- otherwise a dry-run preview wrongly misses
-        # duplicates/overlaps between risks submitted together in one file.
+            write_row(ws, row, risk, fallback_id, is_new_asset)
         existing_rows.append({
             **{k: risk.get(k) for k in COLS},
             "risk_id": risk.get("risk_id", fallback_id),
-            "residual_risk_level": None,
             "_row": row,
         })
         if args.apply:
             row += 1
 
-    print(json.dumps(reports, indent=2))
+    print(json.dumps(reports, indent=2, default=str))
 
     if args.apply:
         wb.save(args.xlsx_path)
